@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use twofloat::TwoFloat;
 
 pub mod context;
+pub(crate) mod codepage;
 pub mod global;
 pub mod inst;
 pub mod opcode;

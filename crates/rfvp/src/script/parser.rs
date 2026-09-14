@@ -3,6 +3,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use core::str::FromStr;
 
+use super::codepage;
+
 #[cfg(feature = "old_school")]
 use alloc::boxed::Box;
 #[cfg(feature = "no_std")]
@@ -95,6 +97,9 @@ pub struct Parser {
     game_mode: u8,
     game_mode_reserved: u8,
     game_title: String,
+    /// Remap table loaded from the release's own engine binary, when the
+    /// release stores text as substitute characters (see `codepage`).
+    remap: Option<codepage::Codepage>,
     pub syscall_count: u16,
     pub syscalls: SyscallMap,
 }
@@ -133,6 +138,7 @@ impl Parser {
                 game_mode: 0,
                 game_mode_reserved: 0,
                 game_title: String::new(),
+                remap: None,
                 syscall_count: 0,
                 syscalls: SyscallMap::default(),
             };
@@ -140,6 +146,11 @@ impl Parser {
             uefi_parser_stage!("[UEFI] Parser::from_bytes before parser()");
             parser.parser()?;
             uefi_parser_stage!("[UEFI] Parser::from_bytes after parser()");
+
+            if let Some(codepage) = codepage::load_from_game_dir() {
+                parser.game_title = codepage.remap(&parser.game_title);
+                parser.remap = Some(codepage);
+            }
 
             Ok(parser)
         }
@@ -175,6 +186,7 @@ impl Parser {
             game_mode: 0,
             game_mode_reserved: 0,
             game_title: String::new(),
+            remap: None,
             syscall_count: 0,
             syscalls: SyscallMap::default(),
         };
@@ -375,7 +387,7 @@ impl Parser {
     }
 
     fn decode_string_bytes(&self, string: &[u8]) -> Result<String> {
-        let s = match self.nls {
+        let mut s = match self.nls {
             Nls::ShiftJIS => {
                 let (s, _, e) = encoding_rs::SHIFT_JIS.decode(&string);
                 if e {
@@ -399,7 +411,11 @@ impl Parser {
             }
         };
 
-        Ok(s.to_string())
+        if let Some(codepage) = &self.remap {
+            s = codepage.remap(&s).into();
+        }
+
+        Ok(s.into_owned())
     }
 
     fn parser(&mut self) -> Result<()> {
