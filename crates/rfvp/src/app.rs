@@ -27,7 +27,7 @@ use winit::{
     window::CustomCursor,
 };
 use winit::{
-    event::{Event, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes},
@@ -197,6 +197,9 @@ pub struct App {
     exit_confirm_ui: ExitConfirmUi,
     builtin_exit_ui_enabled: bool,
     pending_app_exit: bool,
+    /// Finger currently driving the virtual cursor (winit touch path);
+    /// extra fingers are ignored until it lifts.
+    active_touch_id: Option<u64>,
 }
 
 impl App {
@@ -448,6 +451,39 @@ impl App {
                                 }
                                 _ => {}
                             }
+                        }
+                    }
+                    WindowEvent::Touch(touch) => {
+                        // Route the first finger down through the same
+                        // single-finger path the iOS host uses; further
+                        // fingers are ignored until it lifts so resting
+                        // palms or a second tap cannot double-click.
+                        let phase = match touch.phase {
+                            TouchPhase::Started => 0,
+                            TouchPhase::Moved => 1,
+                            TouchPhase::Ended => 2,
+                            TouchPhase::Cancelled => 3,
+                        };
+                        let (id, location) = (touch.id, touch.location);
+                        match phase {
+                            0 => {
+                                if self.active_touch_id.is_none() {
+                                    self.active_touch_id = Some(id);
+                                    self.route_touch_physical(phase, location.x, location.y);
+                                }
+                            }
+                            1 => {
+                                if self.active_touch_id == Some(id) {
+                                    self.route_touch_physical(phase, location.x, location.y);
+                                }
+                            }
+                            2 | 3 => {
+                                if self.active_touch_id == Some(id) {
+                                    self.active_touch_id = None;
+                                    self.route_touch_physical(phase, location.x, location.y);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -1582,11 +1618,21 @@ impl App {
     /// - 3 = cancelled
     #[cfg(target_os = "ios")]
     pub fn host_touch(&mut self, phase: i32, x_points: f64, y_points: f64) {
-        use crate::subsystem::resources::input_manager::KeyCode;
-
         let scale = self.native_scale_factor.max(0.5);
-        let px = x_points * scale;
-        let py = y_points * scale;
+        self.route_touch_physical(phase, x_points * scale, y_points * scale);
+    }
+
+    /// Route a single-finger touch given in physical window pixels through
+    /// the modal UI stack and then into the game input state. Shared by the
+    /// iOS host (after converting points to pixels) and the winit touch path.
+    ///
+    /// `phase`:
+    /// - 0 = began
+    /// - 1 = moved
+    /// - 2 = ended
+    /// - 3 = cancelled
+    fn route_touch_physical(&mut self, phase: i32, px: f64, py: f64) {
+        use crate::subsystem::resources::input_manager::KeyCode;
 
         if self.exit_confirm_ui.is_active() {
             let consumed = self.exit_confirm_ui.handle_touch(
@@ -2702,6 +2748,7 @@ impl AppBuilder {
                 ptr::addr_of_mut!((*p).hud_cursor_pos).write(None);
                 ptr::addr_of_mut!((*p).hud_pointer_down).write(false);
                 ptr::addr_of_mut!((*p).hud_scroll_delta_y).write(0.0);
+                ptr::addr_of_mut!((*p).active_touch_id).write(None);
 
                 // Convert `Box<MaybeUninit<App>>` into `Box<App>` without relying on
                 // `Box::assume_init()` (may be unavailable on older toolchains).
@@ -2887,6 +2934,7 @@ impl AppBuilder {
                 ptr::addr_of_mut!((*p).hud_cursor_pos).write(None);
                 ptr::addr_of_mut!((*p).hud_pointer_down).write(false);
                 ptr::addr_of_mut!((*p).hud_scroll_delta_y).write(0.0);
+                ptr::addr_of_mut!((*p).active_touch_id).write(None);
 
                 let raw: *mut App = Box::into_raw(boxed).cast();
                 Box::from_raw(raw)
@@ -3099,6 +3147,7 @@ impl AppBuilder {
                 ptr::addr_of_mut!((*p).hud_cursor_pos).write(None);
                 ptr::addr_of_mut!((*p).hud_pointer_down).write(false);
                 ptr::addr_of_mut!((*p).hud_scroll_delta_y).write(0.0);
+                ptr::addr_of_mut!((*p).active_touch_id).write(None);
 
                 let raw: *mut App = Box::into_raw(boxed).cast();
                 Box::from_raw(raw)
@@ -3294,6 +3343,7 @@ impl AppBuilder {
                 ptr::addr_of_mut!((*p).hud_cursor_pos).write(None);
                 ptr::addr_of_mut!((*p).hud_pointer_down).write(false);
                 ptr::addr_of_mut!((*p).hud_scroll_delta_y).write(0.0);
+                ptr::addr_of_mut!((*p).active_touch_id).write(None);
 
                 let raw: *mut App = Box::into_raw(boxed).cast();
                 Box::from_raw(raw)
