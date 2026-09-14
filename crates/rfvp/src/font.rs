@@ -126,7 +126,23 @@ impl Font {
 
     /// Return whether the font has a real cmap entry for this character.
     pub fn has_glyph(&self, ch: char) -> bool {
-        self.inner.glyph_id(ch).0 != 0
+        let glyph_id = self.inner.glyph_id(ch);
+        if glyph_id.0 == 0 {
+            return false;
+        }
+        if ch.is_whitespace() {
+            // Whitespace owns no outline, but the primary face must keep its
+            // advance instead of picking up another face's.
+            return true;
+        }
+        // Bundled engine fonts register CJK codepoints far beyond their
+        // outlines; those glyphs rasterize to nothing (e.g. characters a
+        // localized release remaps onto the built-in MS Gothic faces).
+        // Requiring a drawable outline treats them as missing so the caller
+        // falls back to a face that can actually draw the character.
+        let glyph =
+            glyph_id.with_scale_and_position(PxScale::from(16.0), ab_glyph::point(0.0, 0.0));
+        self.inner.outline_glyph(glyph).is_some()
     }
 
     /// Glyph metrics without rasterizing.
