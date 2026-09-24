@@ -263,11 +263,31 @@ impl App {
         }
     }
     fn current_hidpi_scale(&self) -> f32 {
-        self.window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(self.native_scale_factor as f32)
-            .max(1.0)
+        match self.window.as_ref() {
+            Some(w) => (w.scale_factor() as f32).max(1.0),
+            None => self.host_presentation_scale(),
+        }
+    }
+
+    /// Pixel density actually needed by host-driven (iOS/Android) presentation.
+    ///
+    /// The virtual frame is letterboxed into the host drawable, so each virtual pixel covers
+    /// `min(surface / virtual)` device pixels. The platform scale (UIScreen.nativeScale,
+    /// DisplayMetrics.density) is usually much larger (e.g. 2.0 vs ~1.15 on an iPhone XR for a
+    /// 1280x720 game), and using it for text/render-target backing wastes ~3x memory, which is
+    /// enough to get the process killed by jetsam on low-RAM devices.
+    fn host_presentation_scale(&self) -> f32 {
+        let native = self.native_scale_factor as f32;
+        let native = if native.is_finite() { native.max(1.0) } else { 1.0 };
+        let sw = self.surface_config.width.max(1) as f32;
+        let sh = self.surface_config.height.max(1) as f32;
+        let vw = self.virtual_size.0.max(1) as f32;
+        let vh = self.virtual_size.1.max(1) as f32;
+        let fit = (sw / vw).min(sh / vh);
+        if !fit.is_finite() {
+            return native;
+        }
+        fit.clamp(1.0, native)
     }
 
     fn desired_render_target_backing_size(&self) -> (u32, u32) {
@@ -616,12 +636,7 @@ impl App {
         let mut notify_dissolve_done = false;
         let frame_ms: u64;
 
-        let text_render_scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(self.native_scale_factor as f32)
-            .max(1.0);
+        let text_render_scale = self.current_hidpi_scale();
         let pending_exit_dialog = take_pending_exit_dialog_request();
         let pending_save_load = take_pending_save_load_request();
 
@@ -893,6 +908,15 @@ impl App {
             for graph_id in gd.motion_manager.take_pending_gpu_graph_unloads() {
                 self.prim_renderer.remove_graph_cache(graph_id);
             }
+            // Graphs whose CPU pixels were evicted must be re-decoded if the GPU copy went away.
+            {
+                let gd = &mut **gd;
+                let renderer = &self.prim_renderer;
+                gd.motion_manager
+                    .restore_evicted_cpu_pixels(&gd.vfs, |id, gen| {
+                        renderer.is_graph_uploaded(id, gen)
+                    });
+            }
             let surface_size = (self.surface_config.width, self.surface_config.height);
             self.legacy_save_load_ui.update(
                 &self.resources,
@@ -984,6 +1008,15 @@ impl App {
             } else {
                 None
             };
+        }
+
+        // Drop CPU copies of file-backed images that are now resident on the GPU. On unified-memory
+        // devices (iOS/Android) the CPU copy otherwise doubles the memory cost of every image.
+        {
+            let mut gd = gd_write(&self.game_data);
+            let renderer = &self.prim_renderer;
+            gd.motion_manager
+                .evict_uploaded_cpu_pixels(|id, gen| renderer.is_graph_uploaded(id, gen));
         }
 
         // Save thumbnail capture request (resolved after the virtual pass).
