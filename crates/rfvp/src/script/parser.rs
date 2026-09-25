@@ -125,6 +125,11 @@ impl Parser {
         #[cfg(not(feature = "old_school"))]
         {
             uefi_parser_stage!("[UEFI] Parser::from_bytes before Arc::new");
+            // Localized releases may store text as substitute characters; the
+            // release's own engine binary carries the table that restores it.
+            // The script's characters are what confirms a candidate table, so
+            // this has to see the script before it is handed to the parser.
+            let remap = codepage::load_from_game_dir(&buffer);
             let buffer = Arc::new(buffer);
             uefi_parser_stage!("[UEFI] Parser::from_bytes after Arc::new");
             let mut parser = Parser {
@@ -147,7 +152,7 @@ impl Parser {
             parser.parser()?;
             uefi_parser_stage!("[UEFI] Parser::from_bytes after parser()");
 
-            if let Some(codepage) = codepage::load_from_game_dir() {
+            if let Some(codepage) = remap {
                 parser.game_title = codepage.remap(&parser.game_title);
                 parser.remap = Some(codepage);
             }
