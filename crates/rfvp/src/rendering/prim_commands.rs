@@ -13,7 +13,7 @@ use crate::host_api::{
 use crate::subsystem::resources::{
     color_manager::ColorManager,
     graph_buff::GraphBuff,
-    motion_manager::{snow::SnowMotion, MotionManager},
+    motion_manager::{snow::SnowMotion, DissolveType, MotionManager},
     prim::{Prim, PrimManager, PrimType},
 };
 
@@ -34,6 +34,37 @@ impl HostPrimRenderCache {
         Self {
             graphs: Vec::new(),
             white_ready: false,
+        }
+    }
+
+    /// Whether the host holds `graph_id` at `generation` (so its CPU copy may be evicted).
+    pub fn is_graph_uploaded(&self, graph_id: u16, generation: u64) -> bool {
+        self.graph_generation(graph_id) == Some(generation)
+    }
+
+    /// Upload one graph now (see `MotionManager::upload_evicted_one_by_one`).
+    #[cfg(feature = "psx")]
+    pub fn upload_graph<B>(&mut self, backend: &mut B, graph_id: u16, graph: &GraphBuff) -> bool
+    where
+        B: TextureBackend<Error = RfvpError>,
+    {
+        match self.upload_graph_if_needed(backend, graph_id, graph) {
+            Ok(done) => done,
+            Err(err) => {
+                log::error!("graph {graph_id}: upload failed: {err:?}");
+                false
+            }
+        }
+    }
+
+    /// Free the host's copy of a graph the game unloaded.
+    pub fn remove_graph<B>(&mut self, backend: &mut B, graph_id: u16)
+    where
+        B: TextureBackend<Error = RfvpError>,
+    {
+        if let Some(index) = self.graphs.iter().position(|entry| entry.graph_id == graph_id) {
+            self.graphs.swap_remove(index);
+            backend.destroy_texture(host_texture_id(graph_id));
         }
     }
 
@@ -88,21 +119,29 @@ impl HostPrimRenderCache {
     where
         B: TextureBackend<Error = RfvpError>,
     {
+        let generation = graph.get_generation();
+        if self.graph_generation(graph_id) == Some(generation) {
+            // Uploaded already; its CPU pixels may have been evicted since.
+            return Ok(true);
+        }
         let Some(img) = graph.get_texture().as_ref() else {
             return Ok(false);
         };
-        let generation = graph.get_generation();
-        if self.graph_generation(graph_id) == Some(generation) {
-            return Ok(true);
-        }
 
         let (width, height) = img.dimensions();
-        let width = u16::try_from(width).map_err(|_| RfvpError::CapacityExceeded)?;
-        let height = u16::try_from(height).map_err(|_| RfvpError::CapacityExceeded)?;
+        let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
+            log::error!("graph {graph_id} is {width}x{height}: too large for a texture");
+            return Err(RfvpError::CapacityExceeded);
+        };
         let (format, pixels) = match img {
             crate::DynamicImage::ImageRgba8(img) => (TextureFormat::Rgba8, img.as_raw().as_slice()),
             crate::DynamicImage::ImageLumaA8(img) => {
                 (TextureFormat::LumaA8, img.as_raw().as_slice())
+            }
+            #[cfg(feature = "psx")]
+            crate::DynamicImage::ImageClut(img) => {
+                let format = if img.bits == 4 { TextureFormat::Indexed4 } else { TextureFormat::Indexed8 };
+                (format, img.texture_bytes())
             }
         };
         backend.create_texture(
@@ -146,6 +185,24 @@ fn build_draw_model(
     v3d_y: i32,
     v3d_z: i32,
 ) -> Mat4 {
+    // Most console UI primitives only translate. Avoid trigonometry and four
+    // general matrix products on CPUs without hardware floating point.
+    if prim.get_attr() & 4 == 0 && prim.get_angle() == 0 {
+        let pos_x = parent_x + draw_x;
+        let pos_y = parent_y + draw_y;
+        if prim.get_factor_x() == 1000 && prim.get_factor_y() == 1000 {
+            return Mat4::from_translation(vec3(pos_x + off_x, pos_y + off_y, 0.0));
+        }
+        let sx = prim.get_factor_x() as f32 / 1000.0;
+        let sy = prim.get_factor_y() as f32 / 1000.0;
+        return Mat4::from_cols_array(&[
+            sx, 0.0, 0.0, 0.0,
+            0.0, sy, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            pos_x + pivot_x + sx * (off_x - pivot_x),
+            pos_y + pivot_y + sy * (off_y - pivot_y), 0.0, 1.0,
+        ]);
+    }
     let theta = -(prim.get_angle() as f32) * core::f32::consts::TAU / 3600.0;
     let attr = prim.get_attr();
     let pos_x = parent_x + draw_x;
@@ -202,6 +259,16 @@ fn prim_blend(prim: &Prim) -> CommandBlendMode {
     }
 }
 
+fn sprite_corners(model: Mat4, dst_w: f32, dst_h: f32) -> [glam::Vec3; 4] {
+    // Share the transformed origin and edges, including for rotated quads.
+    let p1 = model.w_axis.truncate();
+    let edge_x = model.x_axis.truncate() * dst_w;
+    let edge_y = model.y_axis.truncate() * dst_h;
+    let p0 = p1 + edge_y;
+    let p3 = p1 + edge_x;
+    [p0, p1, p3 + edge_y, p3]
+}
+
 fn emit_sprite(
     commands: &mut Vec<RenderCommand>,
     hit_proxies: &mut HitProxyTable,
@@ -216,10 +283,7 @@ fn emit_sprite(
     texture: DrawTextureKey,
     blend: CommandBlendMode,
 ) -> RfvpResult<()> {
-    let p0 = model.transform_point3(vec3(0.0, dst_h, 0.0));
-    let p1 = model.transform_point3(vec3(0.0, 0.0, 0.0));
-    let p2 = model.transform_point3(vec3(dst_w, dst_h, 0.0));
-    let p3 = model.transform_point3(vec3(dst_w, 0.0, 0.0));
+    let [p0, p1, p2, p3] = sprite_corners(model, dst_w, dst_h);
     let texture = match texture {
         DrawTextureKey::Graph(graph_id) => host_texture_id(graph_id),
         DrawTextureKey::White => WHITE_TEXTURE,
@@ -315,7 +379,10 @@ where
     B: RenderBackend<Error = RfvpError> + TextureBackend<Error = RfvpError>,
 {
     backend.begin_frame(
-        u16::try_from(virtual_size.0).map_err(|_| RfvpError::CapacityExceeded)?,
+        u16::try_from(virtual_size.0).map_err(|_| {
+            log::error!("virtual size {virtual_size:?} is too large");
+            RfvpError::CapacityExceeded
+        })?,
         u16::try_from(virtual_size.1).map_err(|_| RfvpError::CapacityExceeded)?,
     )?;
     cache.ensure_white(backend)?;
@@ -324,6 +391,7 @@ where
     let graphs = motion.graphs();
     let snow_motions = motion.snow_motions();
 
+    let tree_started = crate::perf::start();
     let mut frame = RenderFrame::default();
     let mut order = 0u32;
     let mut visit = vec![0u8; 4096];
@@ -347,6 +415,46 @@ where
         &mut visit,
         0,
     )?;
+
+    // Between the two trees, as the desktop renderer does: the scene dissolve (a full-screen
+    // color fade), then dissolve2 (the engine's own fades around save, load and transitions).
+    // Mask dissolves are not drawn yet, on any platform.
+    let dissolve_alpha = match motion.get_dissolve_type() {
+        DissolveType::Static | DissolveType::ColoredFadeIn | DissolveType::ColoredFadeOut => {
+            Some((motion.get_dissolve_color_id(), motion.get_dissolve_alpha()))
+        }
+        _ => None,
+    };
+    let fades = [
+        dissolve_alpha,
+        Some((motion.get_dissolve2_color_id(), motion.get_dissolve2_alpha())),
+    ];
+    for (color_id, alpha) in fades.into_iter().flatten() {
+        if alpha <= 0.0 {
+            continue;
+        }
+        let c = motion.color_manager.get_entry(color_id as u8);
+        let color = vec4(
+            c.get_r() as f32 / 255.0,
+            c.get_g() as f32 / 255.0,
+            c.get_b() as f32 / 255.0,
+            (c.get_a() as f32 / 255.0) * alpha,
+        );
+        emit_sprite(
+            &mut frame.commands,
+            &mut frame.hit_proxies,
+            &mut order,
+            -1,
+            Mat4::IDENTITY,
+            virtual_size.0 as f32,
+            virtual_size.1 as f32,
+            vec2(0.5, 0.5),
+            vec2(0.5, 0.5),
+            color,
+            DrawTextureKey::White,
+            CommandBlendMode::Normal,
+        )?;
+    }
 
     let root = prim_manager.get_custom_root_prim_id() as i16;
     if root != 0 {
@@ -373,8 +481,13 @@ where
         )?;
     }
 
+    crate::perf::stop(11, tree_started);
+    let t = crate::perf::start();
     backend.submit_commands(&frame.commands)?;
+    crate::perf::stop(12, t);
+    let t = crate::perf::start();
     backend.end_frame()?;
+    crate::perf::stop(13, t);
     Ok(frame)
 }
 
@@ -388,7 +501,7 @@ fn collect_tree<B>(
     virtual_size: (u32, u32),
     prim_manager: &PrimManager,
     color_manager: &ColorManager,
-    graphs: &[GraphBuff],
+    graphs: &crate::subsystem::resources::graph_buff::Graphs,
     snow_motions: &[SnowMotion],
     v3d_x: i32,
     v3d_y: i32,
@@ -427,7 +540,14 @@ where
 
     let mut draw_id = prim_id;
     let mut sprt = base_prim.get_sprt();
+    // A sprite chain that loops back on itself must not hang the frame.
+    let mut sprt_steps = 0u32;
     while sprt != -1 {
+        sprt_steps += 1;
+        if sprt_steps > 4096 {
+            visit[prim_idx] = 2;
+            return Ok(());
+        }
         if sprt < 0 || sprt >= 4096 {
             visit[prim_idx] = 2;
             return Ok(());
@@ -632,10 +752,9 @@ fn emit_graph_sprite(
     text_graph: bool,
     prim_id: i16,
 ) -> RfvpResult<()> {
-    let Some(img) = graph.get_texture().as_ref() else {
+    let Some((tw, th)) = graph.image_dimensions() else {
         return Ok(());
     };
-    let (tw, th) = img.dimensions();
     if tw == 0 || th == 0 {
         return Ok(());
     }
@@ -773,7 +892,7 @@ fn emit_snow<B>(
     hit_proxies: &mut HitProxyTable,
     order: &mut u32,
     virtual_size: (u32, u32),
-    graphs: &[GraphBuff],
+    graphs: &crate::subsystem::resources::graph_buff::Graphs,
     snow_motions: &[SnowMotion],
     prim: &Prim,
     parent_x: f32,
@@ -823,10 +942,9 @@ where
         if !cache.upload_graph_if_needed(backend, graph_id, graph)? {
             continue;
         }
-        let Some(img) = graph.get_texture().as_ref() else {
+        let Some((tw, th)) = graph.image_dimensions() else {
             continue;
         };
-        let (tw, th) = img.dimensions();
         if tw == 0 || th == 0 {
             continue;
         }
@@ -873,4 +991,52 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    #[test]
+    fn shared_edges_preserve_rotated_and_projected_quads() {
+        for attr in [0, 4] {
+            for angle in [0, 450, -900, 1800] {
+                let mut prim = Prim::new();
+                prim.set_attr(attr);
+                prim.set_rotation(angle);
+                prim.set_factor_x(1250);
+                prim.set_factor_y(-800);
+                prim.set_z(1000);
+                let model = build_draw_model((1920, 1080), &prim,
+                    35.0, -20.0, 250.0, 105.0, 18.0, -9.0, 12.0, 24.0, 10, 20, 50);
+                let corners = sprite_corners(model, 320.0, 240.0);
+                for (actual, point) in corners.into_iter().zip([
+                    vec3(0.0, 240.0, 0.0), vec3(0.0, 0.0, 0.0),
+                    vec3(320.0, 240.0, 0.0), vec3(320.0, 0.0, 0.0)]) {
+                    let delta = actual - model.transform_point3(point);
+                    assert!(delta.abs().max_element() < 0.001);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unrotated_models_preserve_scaled_pivots_and_vertices() {
+        for (fx, fy) in [(1000, 1000), (1250, 800), (-1000, 0), (0, -250)] {
+            let mut prim = Prim::new();
+            prim.set_factor_x(fx);
+            prim.set_factor_y(fy);
+            let actual = build_draw_model((1920, 1080), &prim,
+                35.0, -20.0, 250.0, 105.0, 18.0, -9.0, 12.0, 24.0, 0, 0, 0);
+            let expected = Mat4::from_translation(vec3(297.0, 109.0, 0.0))
+                * Mat4::from_scale(vec3(fx as f32 / 1000.0, fy as f32 / 1000.0, 1.0))
+                * Mat4::from_rotation_z(0.0)
+                * Mat4::from_translation(vec3(6.0, -33.0, 0.0));
+            for point in [vec3(0.0, 0.0, 0.0), vec3(320.0, 0.0, 0.0),
+                          vec3(0.0, 240.0, 0.0), vec3(320.0, 240.0, 0.0)] {
+                let delta = actual.transform_point3(point) - expected.transform_point3(point);
+                assert!(delta.abs().max_element() < 0.001);
+            }
+        }
+    }
 }

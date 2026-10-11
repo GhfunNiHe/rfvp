@@ -1,11 +1,10 @@
+#[cfg(feature = "no_std")]
+use alloc::vec::Vec;
 use anyhow::Result;
-#[cfg(not(feature = "no_std"))]
-use std::fs;
 
 #[cfg(not(feature = "no_std"))]
 use crate::debug_ui;
 use crate::script::{context::ThreadState, parser::Parser};
-use crate::subsystem::resources::save_manager::SaveItem;
 use crate::subsystem::resources::{
     motion_manager::DissolveType, thread_manager::ThreadManager, thread_wrapper::ThreadRequest,
 };
@@ -20,6 +19,11 @@ macro_rules! uefi_vm_stage {
 #[cfg(not(target_os = "uefi"))]
 macro_rules! uefi_vm_stage {
     ($($arg:tt)*) => {};
+}
+
+/// The bytes of a save slot's file.
+fn read_slot_for_load(game: &GameData, slot: u32) -> Result<Vec<u8>> {
+    game.save_manager.read_slot_file(slot)
 }
 
 /// Drives the script VM (which is coroutine-based, not OS-thread based).
@@ -87,65 +91,55 @@ impl VmRunner {
             && !game.save_manager.has_pending_vm_snapshot()
         {
             uefi_vm_stage!("[UEFI] VmRunner::tick before capture_snapshot_v1 pre");
+            let started = crate::perf::start();
             let snap = self.tm.capture_snapshot_v1();
             game.save_manager.set_pending_vm_snapshot(snap);
+            crate::perf::stop(21, started);
             uefi_vm_stage!("[UEFI] VmRunner::tick after capture_snapshot_v1 pre");
         }
 
         // Process deferred load requests at a safe point (between VM ticks).
         uefi_vm_stage!("[UEFI] VmRunner::tick before take_load_request");
         if let Some(slot) = game.save_manager.take_load_request() {
-            #[cfg(feature = "no_std")]
-            {
-                let _ = slot;
-            }
-            #[cfg(not(feature = "no_std"))]
-            {
-                let path = SaveItem::resolve_save_path_for_read(slot);
-                match fs::read(&path) {
-                    Ok(bytes) => {
-                        let nls = game.get_nls();
-                        if let Err(e) = game
-                            .save_manager
-                            .load_slot_into_current_from_bytes(slot, nls, &bytes)
-                        {
+            match read_slot_for_load(game, slot) {
+                Ok(bytes) => {
+                    let nls = game.get_nls();
+                    if let Err(e) = game
+                        .save_manager
+                        .load_slot_into_current_from_bytes(slot, nls, &bytes)
+                    {
+                        log::error!(
+                            "load: failed to parse save header for slot {}: {:#}",
+                            slot,
+                            e
+                        );
+                    }
+
+                    match try_decode_state_chunk_v1(&bytes) {
+                        Ok(Some(s)) => {
+                            if let Err(e) = s.apply(game, &mut self.tm) {
+                                log::error!("load: apply SaveStateSnapshotV1 failed: {:#}", e);
+                            }
+                        }
+                        Ok(None) => {
+                            // No state chunk: header-only save (engine save, older rfvp save, or
+                            // one written by the other kind of build).
+                            log::warn!(
+                                "load: no state chunk found in slot {} (header-only load)",
+                                slot
+                            );
+                        }
+                        Err(e) => {
                             log::error!(
-                                "load: failed to parse save header for slot {}: {:#}",
+                                "load: failed to decode state chunk for slot {}: {:#}",
                                 slot,
                                 e
                             );
                         }
-
-                        match try_decode_state_chunk_v1(&bytes) {
-                            Ok(Some(s)) => {
-                                if let Err(e) = s.apply(game, &mut self.tm) {
-                                    log::error!("load: apply SaveStateSnapshotV1 failed: {:#}", e);
-                                }
-                            }
-                            Ok(None) => {
-                                // No RFVS chunk: header-only save (engine save or older rfvp save).
-                                log::warn!(
-                                    "load: no RFVS chunk found in slot {} (header-only load)",
-                                    slot
-                                );
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "load: failed to decode RFVS chunk for slot {}: {:#}",
-                                    slot,
-                                    e
-                                );
-                            }
-                        }
                     }
-                    Err(e) => {
-                        log::error!(
-                            "load: failed to read save slot {} from {}: {:#}",
-                            slot,
-                            path.display(),
-                            e
-                        );
-                    }
+                }
+                Err(e) => {
+                    log::error!("load: failed to read save slot {}: {:#}", slot, e);
                 }
             }
 
@@ -213,8 +207,10 @@ impl VmRunner {
         // If a save capture is pending, snapshot VM state after the tick so the render thread
         // can serialize a consistent coroutine state for this frame.
         if game.save_manager.wants_vm_snapshot_capture() {
+            let started = crate::perf::start();
             let snap = self.tm.capture_snapshot_v1();
             game.save_manager.set_pending_vm_snapshot(snap);
+            crate::perf::stop(21, started);
         }
 
         #[cfg(not(feature = "no_std"))]

@@ -1,0 +1,20 @@
+[package]
+name = "rfvp-horizon"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo Horizon host crate for rfvp no_std core"
+license = "MPL-2.0"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "rfvp_horizon"
+path = "src/lib.rs"
+# Linked into the libnx runtime (platform/switch/runtime/main.c).
+crate-type = ["staticlib"]
+
+[dependencies]
+rfvp = { path = "../../../crates/rfvp", default-features = false, features = ["no_std"] }
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,34 @@
+[package]
+name = "rfvp-psp"
+version = "0.1.0"
+edition = "2021"
+description = "PSP old-school host crate for rfvp no_std core"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "rfvp_psp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rfvp-psp"
+path = "src/main.rs"
+required-features = ["entrypoint"]
+
+[dependencies]
+rfvp = { path = "../../../crates/rfvp", default-features = false, features = ["no_std", "old_school"] }
+
+[target.'cfg(target_os = "psp")'.dependencies]
+# The patched copy in platform/psp/patches/psp; `external-allocator` lets src/heap.rs be the heap.
+psp = { version = "0.3.12", features = ["external-allocator"] }
+talc = { version = "4.4", default-features = false, features = ["lock_api", "counters"] }
+lock_api = "0.4"
+log = "0.4"
+
+[features]
+default = []
+old_school = []
+entrypoint = ["old_school"]
+
+[package.metadata.cargo-psp]
+title = "rfvp-psp"

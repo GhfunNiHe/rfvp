@@ -1,5 +1,63 @@
 use super::error::RfvpResult;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
+
+use crate::subsystem::resources::vfs::ReadSeek;
+// `std` is the crate's own shim in `no_std` builds.
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Mutex;
+
+/// An encoded sound read from its file as it plays instead of held in memory: the music of some
+/// games is tens of megabytes, more than a console with little memory has.
+#[derive(Clone)]
+pub struct AudioByteStream(Arc<Mutex<Box<dyn ReadSeek + Send + Sync>>>);
+
+impl AudioByteStream {
+    pub fn new(stream: Box<dyn ReadSeek + Send + Sync>) -> Self {
+        Self(Arc::new(Mutex::new(stream)))
+    }
+
+    /// Read up to `buf.len()` bytes at `offset`; fewer only at the end.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> RfvpResult<usize> {
+        let mut stream = self
+            .0
+            .lock()
+            .map_err(|_| super::error::RfvpError::Backend)?;
+        stream
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| super::error::RfvpError::Io)?;
+        let mut filled = 0;
+        while filled < buf.len() {
+            match stream.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return Err(super::error::RfvpError::Io),
+            }
+        }
+        Ok(filled)
+    }
+
+    /// The whole sound, for a host that cannot stream it.
+    pub fn read_all(&self) -> RfvpResult<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut chunk = alloc::vec![0u8; 64 * 1024];
+        loop {
+            let n = self.read_at(out.len() as u64, &mut chunk)?;
+            out.extend_from_slice(&chunk[..n]);
+            if n < chunk.len() {
+                return Ok(out);
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AudioByteStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AudioByteStream")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioStreamId(pub u32);
@@ -22,6 +80,9 @@ impl AudioStreamId {
     pub const fn se(slot: usize) -> Self {
         Self(SE_STREAM_ID_BASE + slot as u32)
     }
+
+    /// The soundtrack of the movie playing, if any.
+    pub const MOVIE: Self = Self(0x2000);
 
     pub const fn slot_kind(self) -> Option<AudioSlotKind> {
         if self.0 < BGM_LOGICAL_SLOT_COUNT as u32 {
@@ -60,7 +121,9 @@ pub struct AudioStreamDesc {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioParams {
+    /// Linear gain: 0 is silent, 1 is the sound as recorded.
     pub volume: f32,
+    /// -1 is the left speaker only, 0 the center, 1 the right speaker only.
     pub pan: f32,
     pub repeat: bool,
 }
@@ -82,6 +145,17 @@ pub trait RfvpAudio {
         kind: EncodedAudioKind,
         bytes: &[u8],
     ) -> RfvpResult<()>;
+
+    /// Load a sound that is read as it plays. Hosts that cannot stream leave this out, and the
+    /// core reads the sound whole and calls `load_encoded` instead.
+    fn load_stream(
+        &mut self,
+        _id: AudioStreamId,
+        _kind: EncodedAudioKind,
+        _stream: AudioByteStream,
+    ) -> RfvpResult<()> {
+        Err(super::error::RfvpError::Unsupported)
+    }
 
     fn create_stream(&mut self, id: AudioStreamId, desc: AudioStreamDesc) -> RfvpResult<()>;
 
@@ -110,6 +184,14 @@ pub trait SoftAudioVorbis {
     type Decoder;
 
     fn open(&mut self, bytes: &[u8]) -> RfvpResult<(Self::Decoder, AudioStreamDesc)>;
+
+    /// Open a sound read from `stream` as it decodes (see [`AudioByteStream`]).
+    fn open_stream(
+        &mut self,
+        _stream: AudioByteStream,
+    ) -> RfvpResult<(Self::Decoder, AudioStreamDesc)> {
+        Err(super::error::RfvpError::Unsupported)
+    }
 
     fn decode_interleaved_i16(
         &mut self,
@@ -159,6 +241,10 @@ enum LoadedAudio {
     Ogg {
         desc: AudioStreamDesc,
         bytes: Vec<u8>,
+    },
+    OggStream {
+        desc: AudioStreamDesc,
+        stream: AudioByteStream,
     },
 }
 
@@ -237,6 +323,19 @@ impl<B: SoftAudioVorbis> SoftAudioMixer<B> {
         Ok(())
     }
 
+    /// Load an Ogg Vorbis sound that is decoded from `stream` as it plays.
+    pub fn load_stream(
+        &mut self,
+        id: AudioStreamId,
+        _kind: EncodedAudioKind,
+        stream: AudioByteStream,
+    ) -> RfvpResult<()> {
+        let (decoder, desc) = self.backend.open_stream(stream.clone())?;
+        self.backend.close(decoder);
+        self.replace_loaded(id, LoadedAudio::OggStream { desc, stream });
+        Ok(())
+    }
+
     pub fn create_stream(&mut self, id: AudioStreamId, desc: AudioStreamDesc) -> RfvpResult<()> {
         if desc.sample_rate == 0 || desc.channels == 0 || desc.channels > 2 {
             return Err(super::error::RfvpError::InvalidArgument);
@@ -296,8 +395,14 @@ impl<B: SoftAudioVorbis> SoftAudioMixer<B> {
                 }
                 (*desc, VoiceSource::Pcm)
             }
-            LoadedAudio::Ogg { desc, bytes } => {
-                let (decoder, open_desc) = self.backend.open(bytes)?;
+            LoadedAudio::Ogg { .. } | LoadedAudio::OggStream { .. } => {
+                let (desc, (decoder, open_desc)) = match &loaded.1 {
+                    LoadedAudio::Ogg { desc, bytes } => (desc, self.backend.open(bytes)?),
+                    LoadedAudio::OggStream { desc, stream } => {
+                        (desc, self.backend.open_stream(stream.clone())?)
+                    }
+                    LoadedAudio::Pcm { .. } => unreachable!(),
+                };
                 if open_desc.sample_rate != desc.sample_rate || open_desc.channels != desc.channels
                 {
                     self.backend.close(decoder);
@@ -766,4 +871,96 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> RfvpResult<u32> {
         .get(offset..end)
         .ok_or(super::error::RfvpError::EndOfFile)?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Produces `total_frames` frames of a ramp, then reports end of stream until rewound.
+    struct RampVorbis {
+        total_frames: usize,
+    }
+
+    struct RampDecoder {
+        position: usize,
+    }
+
+    impl SoftAudioVorbis for RampVorbis {
+        type Decoder = RampDecoder;
+
+        fn open(&mut self, _bytes: &[u8]) -> RfvpResult<(Self::Decoder, AudioStreamDesc)> {
+            Ok((
+                RampDecoder { position: 0 },
+                AudioStreamDesc {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: AudioSampleFormat::I16,
+                },
+            ))
+        }
+
+        fn decode_interleaved_i16(
+            &mut self,
+            decoder: &mut Self::Decoder,
+            out_samples: &mut [i16],
+        ) -> RfvpResult<usize> {
+            let frames = (out_samples.len() / 2).min(self.total_frames - decoder.position);
+            for frame in 0..frames {
+                let value = ((decoder.position + frame) % 1000) as i16;
+                out_samples[frame * 2] = value;
+                out_samples[frame * 2 + 1] = value;
+            }
+            decoder.position += frames;
+            Ok(frames * 2)
+        }
+
+        fn seek_start(&mut self, decoder: &mut Self::Decoder) -> RfvpResult<()> {
+            decoder.position = 0;
+            Ok(())
+        }
+
+        fn close(&mut self, _decoder: Self::Decoder) {}
+    }
+
+    fn decoded_len(mixer: &SoftAudioMixer<RampVorbis>) -> usize {
+        match &mixer.voices[0].source {
+            VoiceSource::Ogg { decoded, .. } => decoded.len(),
+            VoiceSource::Pcm => 0,
+        }
+    }
+
+    #[test]
+    fn looping_ogg_voice_keeps_a_bounded_decode_window() {
+        let config = SoftAudioConfig::default();
+        let mut mixer = SoftAudioMixer::new(RampVorbis { total_frames: 10_000 }, config);
+        let id = AudioStreamId::bgm(0);
+        mixer
+            .load_encoded(id, EncodedAudioKind::Ogg, b"OggS")
+            .unwrap();
+        mixer
+            .play(
+                id,
+                AudioParams {
+                    repeat: true,
+                    ..AudioParams::default()
+                },
+                0,
+            )
+            .unwrap();
+
+        // 600 chunks of 1024 frames is ~61 loops of the 10_000 frame track.
+        let mut out = vec![0i16; config.mix_frames * 2];
+        let mut peak = 0;
+        for _ in 0..600 {
+            assert!(mixer.mix_next(&mut out).unwrap());
+            peak = peak.max(decoded_len(&mixer));
+        }
+
+        // A couple of mix chunks of decoded samples at most, never the whole stream.
+        assert!(peak <= config.mix_frames * 2 * 4, "decode window grew to {peak} samples");
+        // The loop itself must keep producing audio.
+        assert!(out.iter().any(|sample| *sample != 0));
+    }
 }

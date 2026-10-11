@@ -36,6 +36,8 @@ log = { version = "0.4.20", optional = true }
 serde = { version = "1.0.196", default-features = false, optional = true }
 serde_json = { version = "1.0.113", optional = true }
 bincode = { version = "1.3.3", optional = true }
+# Save-state encoding for the no_std builds, where bincode (std only) is not available.
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 twofloat = { version = "0.7.0", default-features = false, optional = true }
 winit = {version = "0.30.5", features = ["rwh_05"], optional = true}
 wgpu = { version = "0.19.1", features = ["spirv"], optional = true }
@@ -126,6 +128,7 @@ no_std = [
     "dep:log",
     "dep:miniz_oxide",
     "dep:petitset",
+    "dep:postcard",
     "dep:serde",
     "dep:spin",
     "dep:twofloat",
@@ -137,6 +140,9 @@ no_std = [
 # PSP old-school no_std profile. This is opt-in only and is used by
 # rfvp-psp; default desktop/mobile/wasm builds must not enable it.
 old_school = ["no_std", "dep:rfvp_bitmap", "rfvp_bitmap/alloc"]
+# The PlayStation (platform/ps1): old_school on a game converted by rfvp-psx-convert (CLUT
+# pictures, a fixed-size bitmap font, native sound), sized for 2 MiB of RAM.
+psx = ["old_school"]
 
 # Dependencies required by the historical std/runtime engine modules. This is
 # deliberately separate from `no_std`; no_std builds must not enable it.
