@@ -34,8 +34,8 @@ pub fn is_nvsg(bytes: &[u8]) -> bool {
     bytes.len() >= 16 && &bytes[0..4] == b"hzc1" && &bytes[12..16] == b"NVSG"
 }
 
-/// Convert one NVSG file, scaled by `num / den`. `force4` makes every color picture 4-bit
-/// (16 colors, dithered): half the VRAM of 8-bit, for prims and UI parts.
+/// Convert one NVSG file, scaled by `num / den`. `force4` prefers 4-bit pictures
+/// (16 colors, dithered), subject to alpha, color and compatibility budgets.
 #[cfg(test)]
 pub fn convert(bytes: &[u8], num: u32, den: u32, force4: bool) -> Result<Vec<u8>> {
     convert_with_options(bytes, num, den, force4, Filter::Area, None)
@@ -85,32 +85,42 @@ pub fn convert_with_options(
             let frame = &pixels[f * width * height..(f + 1) * width * height];
             out.extend(resize_gray(frame, width, height, new_w, new_h, kind == 4));
         }
-        return write_zlib(&header, new_w, new_h, kind, &out);
+        let mut encoded = write_zlib(&header, new_w, new_h, kind, &out)?;
+        if kind == 3 {
+            append_mask_coverage(&mut encoded, &out, new_w, new_h, frames)?;
+        }
+        return Ok(encoded);
     }
 
     // Color: RGBA, resized premultiplied (as NVSG's 32-bit pixels are stored) so transparent
     // pixels lend no color, then made straight: a half-transparent texel is blended half and
     // half on the console, so it needs its own color.
-    let mut rgba = Vec::with_capacity(new_w * new_h * 4 * frames);
+    let mut resized_frames = Vec::with_capacity(new_w * new_h * 4 * frames);
     for f in 0..frames {
         let frame = &pixels[f * width * height * depth..(f + 1) * width * height * depth];
         let mut premul = Vec::with_capacity(width * height * 4);
         for p in frame.chunks_exact(depth) {
             let a = if depth == 4 { p[3] } else { 255 };
-            premul.extend_from_slice(&[p[2], p[1], p[0], a]);
+            premul.extend_from_slice(&[p[2].min(a), p[1].min(a), p[0].min(a), a]);
         }
         let resized = match filter {
             Filter::Area => resize_rgba(&premul, width, height, new_w, new_h),
             Filter::DpidBalanced => rfvp_image::resize_rgba(&premul, width, height, new_w, new_h),
         };
-        for p in resized.chunks_exact(4) {
-            let a = p[3] as u32;
-            if a == 0 {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            } else {
-                let un = |c: u8| ((c as u32 * 255 + a / 2) / a).min(255) as u8;
-                rgba.extend_from_slice(&[un(p[0]), un(p[1]), un(p[2]), a as u8]);
-            }
+        resized_frames.extend(resized);
+    }
+    if depth == 4 {
+        if let Some(threshold) = layout.and_then(|r| r.coverage_threshold) {
+            rfvp_image::preserve_alpha_coverage(&pixels, &mut resized_frames, depth, threshold);
+        }
+    }
+    let mut rgba = Vec::with_capacity(resized_frames.len());
+    for p in resized_frames.chunks_exact(4) {
+        let a = p[3] as u32;
+        if a == 0 { rgba.extend_from_slice(&[0, 0, 0, 0]); }
+        else {
+            let un = |c: u8| ((c as u32 * 255 + a / 2) / a).min(255) as u8;
+            rgba.extend_from_slice(&[un(p[0]), un(p[1]), un(p[2]), a as u8]);
         }
     }
 
@@ -127,7 +137,14 @@ pub fn convert_with_options(
     };
     let forced = if force4 && !exact16 {
         let q = quant::quantize(&rgba, new_w, 16, true);
-        (quant::alpha_error(&rgba, &q) <= 64).then_some(q)
+        // Newly compacted gradients must meet an RGB RMS limit of 8/255.
+        // Keep 4-bit eligibility under the former allocator for these resized
+        // pixels. This is not a bound against an older converter's entire pack:
+        // corrected premultiplied pixels and filter fallbacks can change depth.
+        let color_fits = quant::color_mse(&rgba, &q) <= 64;
+        let existing_budget = color_fits || quant::alpha_error(
+            &rgba, &quant::legacy_clut4_budget(&rgba, new_w)) <= 64;
+        (quant::alpha_error(&rgba, &q) <= 64 && existing_budget).then_some(q)
     } else {
         None
     };
@@ -162,7 +179,11 @@ pub fn convert_with_options(
         // Compare the actual palette, packed rows and DMA-padded GPU tiles.
         // A layout can intentionally spend more pixels; filtering cannot add
         // cost beyond Area encoded with that same layout.
-        let baseline = convert_with_options(bytes, num, den, force4, Filter::Area, layout)?;
+        let baseline_layout = layout.cloned().map(|mut rule| {
+            rule.coverage_threshold = None;
+            rule
+        });
+        let baseline = convert_with_options(bytes, num, den, force4, Filter::Area, baseline_layout.as_ref())?;
         if encoded.len() > baseline.len() || vram_bytes(&encoded)? > vram_bytes(&baseline)? {
             return Ok(baseline);
         }
@@ -170,7 +191,43 @@ pub fn convert_with_options(
     Ok(encoded)
 }
 
+/// Preserve the Area alpha plane and append offline, GPU-ready Bayer coverage.
+fn append_mask_coverage(encoded: &mut Vec<u8>, alpha: &[u8], width: usize, height: usize, frames: usize) -> Result<()> {
+    use crate::mask_format as mask;
+    let stride = width.next_multiple_of(2);
+    ensure!(stride <= u16::MAX as usize, "PS1 mask stride exceeds u16");
+    let start = encoded.len();
+    encoded.extend_from_slice(mask::HEADER_MAGIC);
+    encoded.extend_from_slice(&(width as u16).to_le_bytes());
+    encoded.extend_from_slice(&(height as u16).to_le_bytes());
+    encoded.extend_from_slice(&(frames as u32).to_le_bytes());
+    encoded.extend_from_slice(&(stride as u16).to_le_bytes());
+    encoded.extend_from_slice(&[0, 0]);
+    for frame in alpha.chunks_exact(width * height) {
+        encoded.extend_from_slice(&256u16.to_le_bytes());
+        encoded.extend_from_slice(&(stride as u16).to_le_bytes());
+        for index in 0..256 {
+            encoded.extend_from_slice(&mask::PALETTE[mask::palette_state(index as u8, 255) as usize].to_le_bytes());
+        }
+        for y in 0..height {
+            for x in 0..stride {
+                encoded.push(if x < width { mask::coverage_index(frame[y * width + x], x, y) } else { 0 });
+            }
+        }
+    }
+    let length = u32::try_from(encoded.len() - start).context("PS1 mask trailer exceeds u32")?;
+    encoded.extend_from_slice(&length.to_le_bytes());
+    encoded.extend_from_slice(mask::FOOTER_MAGIC);
+    Ok(())
+}
+
 pub fn vram_bytes(encoded: &[u8]) -> Result<usize> {
+    if let Some(mask) = crate::mask_format::read(encoded).map_err(anyhow::Error::msg)? {
+        let rows: usize = (0..usize::from(mask.width)).step_by(126).map(|x| {
+            (usize::from(mask.width) - x).min(126).div_ceil(2).next_multiple_of(2) * 2
+        }).sum();
+        return Ok((rows * usize::from(mask.height) + 512) * mask.frames as usize);
+    }
     let h = &encoded[12..];
     let kind = read_u16(h, 6)?;
     let width = read_u16(h, 8)? as usize;
@@ -333,7 +390,8 @@ mod tests {
         let mut input = nvsg(2, 11, 7, 2, &px);
         input[24..32].copy_from_slice(&[3, 0, 4, 0, 5, 0, 6, 0]);
         let area = convert_with_options(&input, 1, 2, true, Filter::Area, None).unwrap();
-        let dpid = convert_with_options(&input, 1, 2, true, Filter::DpidBalanced, None).unwrap();
+        let rule = LayoutRule { scale: 1.0, offset_x: None, offset_y: None, coverage_threshold: Some(192) };
+        let dpid = convert_with_options(&input, 1, 2, true, Filter::DpidBalanced, Some(&rule)).unwrap();
         assert_eq!(&dpid[24..36], &input[24..36]);
         assert!(dpid.len() <= area.len());
         assert!(vram_bytes(&dpid).unwrap() <= vram_bytes(&area).unwrap());
@@ -341,7 +399,7 @@ mod tests {
 
     #[test]
     fn layout_changes_geometry_but_never_masks() {
-        let rule = LayoutRule { scale: 2.0, offset_x: Some(90), offset_y: Some(120) };
+        let rule = LayoutRule { scale: 2.0, offset_x: Some(90), offset_y: Some(120), coverage_threshold: Some(192) };
         let input = nvsg(1, 12, 8, 1, &[0, 0, 255, 255].repeat(96));
         let out = convert_with_options(&input, 1, 2, true, Filter::DpidBalanced, Some(&rule)).unwrap();
         assert_eq!(read_u16(&out, 20).unwrap(), 12);
@@ -351,5 +409,24 @@ mod tests {
         let mask = nvsg(3, 12, 8, 1, &[128; 96]);
         let out = convert_with_options(&mask, 1, 2, true, Filter::DpidBalanced, Some(&rule)).unwrap();
         assert_eq!(out, convert(&mask, 1, 2, true).unwrap());
+    }
+
+    #[test]
+    fn explicit_coverage_keeps_a_thin_edge_in_the_opaque_ps1_class() {
+        let px: Vec<u8> = [255, 255, 0, 0, 255, 0, 0, 0].into_iter()
+            .flat_map(|a| [a, a, a, a]).collect();
+        let input = nvsg(1, 4, 2, 1, &px);
+        let rule = LayoutRule { scale: 1.0, offset_x: None, offset_y: None, coverage_threshold: Some(192) };
+        let before = convert_with_options(&input, 1, 2, true, Filter::Area, None).unwrap();
+        let after = convert_with_options(&input, 1, 2, true, Filter::Area, Some(&rule)).unwrap();
+        assert_eq!(&before[18..36], &after[18..36]);
+        assert_eq!(before.len(), after.len());
+        let alpha = |image: &[u8]| { let p = &image[44..]; p[4 + 32 + (p[52] & 15) as usize] };
+        assert!(alpha(&before) < 192);
+        assert!(alpha(&after) >= 192);
+        let payload = &after[44..];
+        let color = read_u16(payload, 4 + (payload[52] & 15) as usize * 2).unwrap();
+        assert_ne!(color, 0);
+        assert_eq!(color & 0x8000, 0);
     }
 }
