@@ -28,7 +28,10 @@ struct SavedStackInfo {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Table {
+    #[cfg(not(feature = "psx"))]
     table: StableHashMap<u32, Variant>,
+    #[cfg(feature = "psx")]
+    table: alloc::sync::Arc<StableHashMap<u32, Variant>>,
     count: u32,
     next_index: u32,
 }
@@ -36,16 +39,24 @@ pub struct Table {
 impl Table {
     pub fn new() -> Self {
         Table {
-            table: StableHashMap::default(),
+            table: Default::default(),
             count: 0,
             next_index: 0,
         }
     }
 
+    fn entries_mut(&mut self) -> &mut StableHashMap<u32, Variant> {
+        #[cfg(feature = "psx")]
+        { alloc::sync::Arc::make_mut(&mut self.table) }
+        #[cfg(not(feature = "psx"))]
+        { &mut self.table }
+    }
+
     pub fn push(&mut self, value: Variant) {
         // Array-style append.
         // Keep count consistent if a key is unexpectedly overwritten.
-        let existed = self.table.insert(self.next_index, value).is_some();
+        let key = self.next_index;
+        let existed = self.entries_mut().insert(key, value).is_some();
         if !existed {
             self.count += 1;
         }
@@ -54,7 +65,7 @@ impl Table {
 
     pub fn insert(&mut self, key: u32, value: Variant) {
         // Map-style insert. Overwriting an existing key must not bump the element count.
-        let existed = self.table.insert(key, value).is_some();
+        let existed = self.entries_mut().insert(key, value).is_some();
         if !existed {
             self.count += 1;
         }
@@ -66,6 +77,10 @@ impl Table {
 
     pub fn get(&self, key: u32) -> Option<&Variant> {
         self.table.get(&key)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (u32, &Variant)> {
+        self.table.iter().map(|(k, v)| (*k, v))
     }
 }
 
@@ -314,10 +329,21 @@ impl Variant {
     }
 
     pub fn greater(&mut self, other: &Variant) {
-        let result = match (self.clone(), other) {
+        #[cfg(feature = "psx")]
+        if let Some(order) = ps1_finite_number_order(self, other) {
+            *self = if order.is_gt() { Variant::True } else { Variant::Nil };
+            return;
+        }
+        #[cfg(not(feature = "psx"))]
+        let lhs = self.clone();
+        #[cfg(not(feature = "psx"))]
+        let lhs = &lhs;
+        #[cfg(feature = "psx")]
+        let lhs = &*self;
+        let result = match (lhs, other) {
             (Variant::Int(a), Variant::Int(b)) => {
                 // 16 = 2 * 7 + 2
-                if a > *b {
+                if a > b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -325,7 +351,7 @@ impl Variant {
             }
             (Variant::Int(a), Variant::Float(b)) => {
                 // 17 = 2 * 7 + 3
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
 
                 if wrapped_a > wrapped_b {
@@ -336,7 +362,7 @@ impl Variant {
             }
             (Variant::Float(a), Variant::Int(b)) => {
                 // 23 = 3 * 7 + 2
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
 
                 if wrapped_a > wrapped_b {
@@ -347,7 +373,7 @@ impl Variant {
             }
             (Variant::Float(a), Variant::Float(b)) => {
                 // 24 = 3 * 7 + 3
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
 
                 if wrapped_a > wrapped_b {
@@ -366,7 +392,7 @@ impl Variant {
                 //
                 // In fact, the VM seems never use the partial comparison (less than, greater than, etc) for strings
                 // so we can just use the default string comparison for now
-                if a > *b {
+                if a > b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -374,7 +400,7 @@ impl Variant {
             }
             (Variant::String(a), Variant::ConstString(b, _)) => {
                 // 33 = 4 * 7 + 5
-                if a > *b {
+                if a > b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -382,7 +408,7 @@ impl Variant {
             }
             (Variant::ConstString(a, _), Variant::String(b)) => {
                 // 39 = 5 * 7 + 4
-                if a > *b {
+                if a > b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -390,7 +416,7 @@ impl Variant {
             }
             (Variant::ConstString(a, _), Variant::ConstString(b, _)) => {
                 // 40 = 5 * 7 + 5
-                if a > *b {
+                if a > b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -403,16 +429,27 @@ impl Variant {
     }
 
     pub fn less(&mut self, other: &Variant) {
-        let result = match (self.clone(), other) {
+        #[cfg(feature = "psx")]
+        if let Some(order) = ps1_finite_number_order(self, other) {
+            *self = if order.is_lt() { Variant::True } else { Variant::Nil };
+            return;
+        }
+        #[cfg(not(feature = "psx"))]
+        let lhs = self.clone();
+        #[cfg(not(feature = "psx"))]
+        let lhs = &lhs;
+        #[cfg(feature = "psx")]
+        let lhs = &*self;
+        let result = match (lhs, other) {
             (Variant::Int(a), Variant::Int(b)) => {
-                if a < *b {
+                if a < b {
                     Variant::True
                 } else {
                     Variant::Nil
                 }
             }
             (Variant::Int(a), Variant::Float(b)) => {
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
                 if wrapped_a < wrapped_b {
                     Variant::True
@@ -421,7 +458,7 @@ impl Variant {
                 }
             }
             (Variant::Float(a), Variant::Int(b)) => {
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
                 if wrapped_a < wrapped_b {
                     Variant::True
@@ -430,7 +467,7 @@ impl Variant {
                 }
             }
             (Variant::Float(a), Variant::Float(b)) => {
-                let wrapped_a = TwoFloat::from(a);
+                let wrapped_a = TwoFloat::from(*a);
                 let wrapped_b = TwoFloat::from(*b);
                 if wrapped_a < wrapped_b {
                     Variant::True
@@ -439,28 +476,28 @@ impl Variant {
                 }
             }
             (Variant::String(a), Variant::String(b)) => {
-                if a < *b {
+                if a < b {
                     Variant::True
                 } else {
                     Variant::Nil
                 }
             }
             (Variant::String(a), Variant::ConstString(b, _)) => {
-                if a < *b {
+                if a < b {
                     Variant::True
                 } else {
                     Variant::Nil
                 }
             }
             (Variant::ConstString(a, _), Variant::String(b)) => {
-                if a < *b {
+                if a < b {
                     Variant::True
                 } else {
                     Variant::Nil
                 }
             }
             (Variant::ConstString(a, _), Variant::ConstString(b, _)) => {
-                if a < *b {
+                if a < b {
                     Variant::True
                 } else {
                     Variant::Nil
@@ -492,6 +529,20 @@ impl Variant {
         } else {
             *self = Variant::Nil;
         }
+    }
+}
+
+/// Finite f32 and i32 operands convert exactly to f64, with zero low words in
+/// TwoFloat. Comparing them directly preserves ordering without double-double
+/// validity checks. Nonfinite values retain the original TwoFloat path.
+#[cfg(feature = "psx")]
+fn ps1_finite_number_order(a: &Variant, b: &Variant) -> Option<core::cmp::Ordering> {
+    match (a, b) {
+        (Variant::Int(a), Variant::Int(b)) => Some(a.cmp(b)),
+        (Variant::Float(a), Variant::Float(b)) if a.is_finite() && b.is_finite() => a.partial_cmp(b),
+        (Variant::Int(a), Variant::Float(b)) if b.is_finite() => f64::from(*a).partial_cmp(&f64::from(*b)),
+        (Variant::Float(a), Variant::Int(b)) if a.is_finite() => f64::from(*a).partial_cmp(&f64::from(*b)),
+        _ => None,
     }
 }
 
@@ -624,7 +675,7 @@ pub fn vm_div(a: Variant, b: Variant) -> Variant {
     }
 }
 
-fn vm_mod(a: Variant, b: Variant) -> Variant {
+pub fn vm_mod(a: Variant, b: Variant) -> Variant {
     match (a, b) {
         (Variant::Int(a), Variant::Int(b)) => {
             if b == 0 || (a == i32::MIN && b == -1) {
@@ -640,3 +691,4 @@ fn vm_mod(a: Variant, b: Variant) -> Variant {
 pub trait VmSyscall {
     fn do_syscall(&mut self, name: &str, args: Vec<Variant>) -> anyhow::Result<Variant>;
 }
+

@@ -409,6 +409,7 @@ impl App {
                         // );
                     }
                     WindowEvent::RedrawRequested => {
+                        self.mem_report();
                         // Drive the simulation from redraws so we do not busy-spin.
                         // The VM is cooperative and now advances until script/syscall yield points
                         // such as WAIT/SLEEP/NEXT/ShouldBreak, matching the original engine style.
@@ -630,6 +631,56 @@ impl App {
         let _result = event_loop.run(move |event, loopd| {
             self.handle_event(event, loopd);
         });
+    }
+
+    /// With `RFVP_MEM_REPORT=1`, the memory the frame holds, to stderr every 300 redraws: GPU
+    /// textures and render targets, and the CPU copies of pictures.
+    fn mem_report(&mut self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static REDRAWS: AtomicU32 = AtomicU32::new(0);
+        if REDRAWS.fetch_add(1, Ordering::Relaxed) % 300 != 0
+            || std::env::var_os("RFVP_MEM_REPORT").is_none()
+        {
+            return;
+        }
+        use crate::rfvp_render::mem_stats as m;
+        let (mut cpu_images, mut cpu_bytes, mut masks) = (0u64, 0u64, 0u64);
+        {
+            let gd = gd_read(&self.game_data);
+            for g in gd.motion_manager.graphs().iter() {
+                if let Some(img) = g.texture.as_ref() {
+                    let (w, h) = image::GenericImageView::dimensions(img);
+                    cpu_images += 1;
+                    cpu_bytes += w as u64 * h as u64 * 4;
+                }
+                if g.is_cpu_evicted() {
+                    masks += 1;
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let metal = unsafe {
+            self.resources.device.as_hal::<wgpu::hal::api::Metal, _, _>(|device| {
+                device.map(|d| d.raw_device().lock().current_allocated_size() >> 20)
+            })
+        }
+        .flatten()
+        .unwrap_or(0);
+        #[cfg(not(target_os = "macos"))]
+        let metal = 0u64;
+        eprintln!(
+            "mem: metal device {} MiB, gpu textures {} ({} MiB, {} made, {} MiB written), render targets {} ({} MiB), cpu images {} ({} MiB), evicted {}",
+            metal,
+            m::TEXTURES.load(Ordering::Relaxed),
+            m::TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
+            m::TEXTURES_MADE.load(Ordering::Relaxed),
+            m::TEXTURE_WRITES.load(Ordering::Relaxed) >> 20,
+            m::TARGETS.load(Ordering::Relaxed),
+            m::TARGET_BYTES.load(Ordering::Relaxed) >> 20,
+            cpu_images,
+            cpu_bytes >> 20,
+            masks,
+        );
     }
 
     fn next_frame(&mut self) -> (u64, bool) {
@@ -928,10 +979,41 @@ impl App {
                 .update(&self.resources, self.virtual_size, surface_size);
         }
 
+        // Save thumbnail: as in the original engine (SaveCreate(3) reads its render target back
+        // when called), the frame last shown, before the script's new state (a menu) is drawn.
+        let save_capture = gd_read(&self.game_data).save_manager.pending_save_capture();
+        let save_frame = save_capture.map(|_| {
+            let mut encoder = self.resources.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("rfvp save capture") },
+            );
+            let readback = self
+                .render_target
+                .encode_readback_rgba8(&self.resources.device, &mut encoder);
+            self.resources.queue.submit(Some(encoder.finish()));
+            let rgba = readback.map_to_rgba8(&self.resources.device);
+            (readback.width, readback.height, rgba)
+        });
+
         let dissolve_color: Option<glam::Vec4>;
         let dissolve2_color: Option<glam::Vec4>;
         {
             let gd = gd_read(&self.game_data);
+
+            // A mask dissolve that just started wipes away the frame last shown, which is still
+            // in the render target.
+            if self.prim_renderer.mask_wants_snapshot(&gd.motion_manager) {
+                let mut encoder = self.resources.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("rfvp dissolve snapshot") },
+                );
+                let readback = self
+                    .render_target
+                    .encode_readback_rgba8(&self.resources.device, &mut encoder);
+                self.resources.queue.submit(Some(encoder.finish()));
+                let rgba = readback.map_to_rgba8(&self.resources.device);
+                if let Some(frame) = image::RgbaImage::from_raw(readback.width, readback.height, rgba) {
+                    self.prim_renderer.set_mask_snapshot(&gd.motion_manager, frame);
+                }
+            }
 
             // Build primitive draw list and upload any modified GraphBuffs to the GPU.
             self.prim_renderer
@@ -1016,12 +1098,6 @@ impl App {
                 .evict_uploaded_cpu_pixels(|id, gen| renderer.is_graph_uploaded(id, gen));
         }
 
-        // Save thumbnail capture request (resolved after the virtual pass).
-        let save_capture = {
-            let gd = gd_read(&self.game_data);
-            gd.save_manager.pending_save_capture()
-        };
-
         let mut encoder =
             self.resources
                 .device
@@ -1078,11 +1154,6 @@ impl App {
             );
         }
 
-        // If a SaveWrite is pending, capture the current virtual render target to CPU.
-        let save_readback = save_capture.map(|_| {
-            self.render_target
-                .encode_readback_rgba8(&self.resources.device, &mut encoder)
-        });
         // `RFVP_DUMP_FRAMES`: the frame as rendered, for comparing renderers.
         let dump_path = frame_dump_path(self.debug_frame_no);
         let dump_readback = dump_path.as_ref().map(|_| {
@@ -1192,10 +1263,9 @@ impl App {
             }
         }
 
-        if let (Some(readback), Some((slot, thumb_w, thumb_h))) = (save_readback, save_capture) {
-            let src_w = readback.width.max(1);
-            let src_h = readback.height.max(1);
-            let rgba = readback.map_to_rgba8(&self.resources.device);
+        if let (Some((src_w, src_h, rgba)), Some((slot, thumb_w, thumb_h))) = (save_frame, save_capture) {
+            let src_w = src_w.max(1);
+            let src_h = src_h.max(1);
 
             let thumb_rgba = if thumb_w > 0 && thumb_h > 0 && (thumb_w != src_w || thumb_h != src_h)
             {
@@ -2324,7 +2394,9 @@ impl AppBuilder {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: swapchain_capabilities.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // One frame in flight: the layer keeps two drawables, not three (each 4K on a Retina
+            // screen, about 30 MiB); a visual novel loses nothing.
+            desired_maximum_frame_latency: 1,
         };
 
         surface.configure(&device, &config);
@@ -3582,3 +3654,4 @@ fn frame_dump_path(frame: u64) -> Option<std::path::PathBuf> {
 fn frame_dump_path(_frame: u64) -> Option<std::path::PathBuf> {
     None
 }
+
